@@ -1,0 +1,259 @@
+---
+title: "DWV Assignment 9 Swiston"
+author: "Bryn Swiston"
+format:
+  pdf: default
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#I will now open and activate the necessary libraries
+library(tidyverse)
+library(igraph)
+library(countrycode)
+library(ggraph)
+library(patchwork)
+```
+
+```{r}
+#Now I want to read in the data file that I will need. I pulled this from the UN online database, which is really extensive and well managed. It is a huge dataset.
+votes <- read_csv("/Users/brynswiston/Downloads/2026_10_15_votes_ga.csv")
+```
+
+```{r}
+# I want to keep only real votes
+v <- votes |>
+  filter(ms_vote %in% c("Y", "N", "A")) |>
+  select(undl_id, ms_code, ms_vote) |>
+  distinct(undl_id, ms_code, .keep_all = TRUE)
+```
+
+```{r}
+#For each roll call, how big is the minority? We need to know how many disagreed with the majority, making it a contested vote.
+contested <- v |>
+  count(undl_id, ms_vote) |>
+  group_by(undl_id) |>
+  summarise(minority_share = 1 - max(n) / sum(n), .groups = "drop")
+```
+
+```{r}
+#I'm deciding to keep roll calls where at least 10% of voters were in the minority
+keep <- contested |> filter(minority_share >= 0.10) |> pull(undl_id)
+v_c <- v |> filter(undl_id %in% keep)
+```
+
+```{r}
+#Now I have to build my matrix. 
+wide <- v_c %>% pivot_wider(names_from = ms_code, values_from = ms_vote)
+m <- as.matrix(wide[, -1])
+
+ind <- function(x, val) { out <- (x == val) * 1; out[is.na(out)] <- 0; out }
+Y <- ind(m, "Y"); A <- ind(m, "A"); N <- ind(m, "N")
+valid <- (!is.na(m)) * 1
+
+agree <- crossprod(Y) + crossprod(A) + crossprod(N)
+both  <- crossprod(valid)
+adj_c <- agree / both
+adj_c[both < 100] <- 0    
+adj_c[is.na(adj_c)] <- 0
+diag(adj_c) <- 0
+```
+
+```{r}
+#Because we're working with countries and old data, I have to be sure to remove any countries that don't exist anymore. 
+old <- c("SUN","DDR","CSK","YMD","YUG","SCG","EAT","EAZ")
+adj_c <- adj_c[!rownames(adj_c) %in% old, !colnames(adj_c) %in% old]
+```
+
+```{r}
+#I want to thin the network so that each country only keeps its closest voting partners, otherwise my graph will hairball. 
+k <- 10
+adj_k <- adj_c
+for (i in 1:nrow(adj_k)) {
+  keep <- order(adj_k[i, ], decreasing = TRUE)[1:k]
+  adj_k[i, -keep] <- 0
+}
+```
+
+```{r}
+#I've run into the issue that two countries may not have each other in their top ten. I found a fix though. 
+adj_k <- pmax(adj_k, t(adj_k))
+```
+
+```{r}
+#This will turn the matrix into an igraph network. 
+g <- graph_from_adjacency_matrix(adj_k, mode = "undirected",
+                                 weighted = TRUE, diag = FALSE)
+#And I want to delete any isolated countries
+g <- delete_vertices(g, which(degree(g) == 0))
+vcount(g)
+```
+
+```{r}
+#This finds groups of countries that vote together, decides where each country’s dot goes, and sets up the colors for groups.
+set.seed(123)
+comm <- cluster_louvain(g)
+mem  <- membership(comm)
+lay  <- layout_with_fr(g, weights = E(g)$weight, niter = 5000)
+lay  <- norm_coords(lay, -1, 1, -1, 1)
+pal  <- c("#A8D5E2", "#F9D49B", "#B7DDB0", "#F2B1B8", "#D2BEE6", "#F5EC9B")
+```
+
+```{r}
+#I want to convert codes to names for easier reading. 
+nm <- countrycode(V(g)$name, origin = "iso3c", destination = "country.name",
+                  custom_match = c(SUN = "USSR", DDR = "East Germany",
+                                   CSK = "Czechoslovakia", YMD = "South Yemen",
+                                   YUG = "Yugoslavia", SCG = "Serbia & Montenegro",
+                                   EAT = "Tanganyika", EAZ = "Zanzibar"))
+```
+
+```{r}
+# Here I will choose which countries to label
+show <- c("USA","CAN","GBR","FRA","DEU","JPN","ISR","RUS","CHN","IND",
+          "BRA","MEX","ZAF","SAU","IRN","EGY","TUR","UKR","CUB","NGA")
+```
+
+```{r}
+# I also want to make sure every color group gets at least one label
+str <- strength(g)
+for (grp in sort(unique(mem))) {
+  members <- names(mem)[mem == grp]
+  if (!any(members %in% show)) {
+    show <- c(show, members[which.max(str[members])])
+  }
+}
+cols_grp <- setNames(pal[(seq_len(max(mem)) - 1) %% length(pal) + 1],
+                     seq_len(max(mem)))
+```
+
+```{r}
+# Labels are now full names
+V(g)$lab <- ifelse(V(g)$name %in% show, nm, NA)
+
+#I want to label the "bridging states" as well. 
+bridges <- c("ARM","NRU","KIR","SRB","CYP","PLW")
+west    <- as.integer(mem["USA"])
+show    <- setdiff(show, bridges)
+df <- data.frame(x = lay[,1], y = lay[,2], name = V(g)$name, full = nm, grp = factor(mem))
+```
+
+```{r}
+#Now I will add a new column with the special states and the bridge states. 
+df$feat <- df$name %in% c(show, bridges)
+```
+
+```{r}
+#I want to pull the Western group toward the rest. This whole chunk is going to help me take care of spacing. It resulted from a lot of trial and error and bad graphs. 
+W <- 16; H <- 9
+xs <- W / diff(range(df$x)); ys <- H / diff(range(df$y))
+px <- df$x * xs; py <- df$y * ys        
+
+wi <- which(mem == west)                    
+oi <- which(mem != west)                  
+
+dir <- c(mean(px[oi]) - mean(px[wi]), mean(py[oi]) - mean(py[wi]))
+dir <- dir / sqrt(sum(dir^2))               
+
+min_gap <- 0.30                             
+gap <- function(shift) {
+  ax <- px[wi] + dir[1] * shift; ay <- py[wi] + dir[2] * shift
+  min(sqrt(outer(ax, px[oi], "-")^2 + outer(ay, py[oi], "-")^2))
+}
+
+shift <- 0
+while (gap(shift + 0.05) > min_gap && shift < 50) shift <- shift + 0.05
+
+px[wi] <- px[wi] + dir[1] * shift
+py[wi] <- py[wi] + dir[2] * shift
+df$x <- px / xs; df$y <- py / ys
+```
+
+```{r}
+#Time to graph!
+p <- ggraph(g, layout = "manual", x = df$x, y = df$y) +
+  geom_edge_link(color = "grey40", alpha = 0.12, width = 0.3) +
+  geom_point(data = df, aes(x = x, y = y, fill = grp),
+             shape = 21, size = 6, stroke = 0.4, color = "grey30") +
+  
+#Heavier outline on featured and bridge countries (same size)
+  geom_point(data = df[df$feat, ], aes(x = x, y = y),
+             shape = 21, size = 6, stroke = 1.5, color = "black", fill = NA) +
+  geom_text(data = df, aes(x = x, y = y, label = name),
+            size = 2, fontface = "bold", color = "black") +
+  scale_fill_manual(values = cols_grp) +
+  coord_cartesian(clip = "off") +
+  expand_limits(x = c(min(df$x) - 0.1, max(df$x) + 0.1),
+                y = c(min(df$y) - 0.1, max(df$y) + 0.1)) +
+  theme_void() +
+  theme(legend.position = "none")
+p <- p + labs(
+  title = "UN Voting Patterns on GA Resolutions, 1946-2026",
+  subtitle = "Country alignment on contested UN General Assembly votes. Lines connect countries that most often vote alike; colors show detected groups."
+) +
+  theme(plot.title = element_text(size = 28, face = "bold", hjust = 0),
+        plot.subtitle = element_text(size = 14, hjust = 0, color = "grey30"))
+
+ggsave("network_slide.png", p, width = 16, height = 9, dpi = 300)
+```
+
+## Figure 1
+
+```{r}
+#I want to build a key table that gives country names of interest.
+key <- df[df$feat, c("name", "full", "grp")]
+key$type <- ifelse(key$name %in% bridges, "bridge", "feature")
+
+feat <- key[key$type == "feature", ]; feat <- feat[order(feat$full), ]
+br   <- key[key$type == "bridge", ];  br   <- br[order(br$full), ]
+
+#Vertical positions (top to bottom: featured, gap, bridge states)
+nb <- nrow(br); nf <- nrow(feat)
+br$y   <- seq(nb, 1)
+feat$y <- nb + 3 + seq(nf, 1)
+heads <- data.frame(
+  y     = c(nb + 1, nb + 3 + nf + 1),
+  label = c("Bridge states (link to Western bloc)", "Featured countries")
+)
+key2 <- rbind(feat, br)
+
+#Here I will make the key panel
+key_plot <- ggplot() +
+  geom_text(data = heads, aes(x = 0, y = y, label = label),
+            hjust = 0, fontface = "bold", size = 5) +
+  geom_point(data = key2, aes(x = 0.08, y = y, fill = grp),
+             shape = 21, size = 6, stroke = 1.5, color = "black") +
+  geom_text(data = key2, aes(x = 0.08, y = y, label = name),
+            size = 2, fontface = "bold") +
+  geom_text(data = key2, aes(x = 0.2, y = y, label = full),
+            hjust = 0, size = 4.5) +
+  scale_fill_manual(values = cols_grp) +
+  scale_x_continuous(limits = c(0, 1.6)) +
+  scale_y_continuous(limits = c(0, nb + 3 + nf + 1.8)) +
+  theme_void() +
+  theme(legend.position = "none")
+```
+
+```{r}
+#Combine with the network and save, making sure width and height are all good.
+final <- p + key_plot + plot_layout(widths = c(4, 1))
+asp <- diff(range(df$x)) * xs / (diff(range(df$y)) * ys)
+ggsave("network_slide_key.png", final, width = 9 * asp + 4, height = 9, dpi = 300)
+
+final
+```
+
+## Data: 
+
+### The data come from the United Nations Digital Library voting database, which records every country’s vote on each General Assembly roll call.
+
+## Network: 
+
+### The nodes are countries. An edge connects two countries that often voted the same way (Yes, No, or Abstain) on contested roll calls, weighted by the share of shared votes on which they agreed. In R, I kept only contested votes (at least 10% of voters in the minority), removed countries that no longer exist, and kept each country’s 10 strongest ties. Colors show groups found with the Louvain method.
+
+## What stands out: 
+
+### The Western group (the US, Canada, Europe, Japan, and a few partners) is tightly connected but has few ties to the rest of the Assembly. A handful of bridge states (Armenia, Nauru, Kiribati, Serbia, Cyprus, and Palau) link it to the other groups. Closer dots vote more alike, but exact distances aren’t meaningful, and the groups shift somewhat with my cutoffs.
